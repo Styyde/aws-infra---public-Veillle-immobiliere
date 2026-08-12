@@ -1,0 +1,34 @@
+# Ignorer le dossier .terraform (modules, providers téléchargés)
+.terraform/
+.terraform.lock.hcl
+
+# Ignorer les fichiers d'état (locaux)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Ignorer les fichiers de variables sensibles (contenant des secrets)
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Ignorer les fichiers de plan Terraform
+*.plan
+*.out
+
+# Ignorer les logs, traces, fichiers de test
+*.log
+crash.log
+crash.*.log
+
+# Ignorer les fichiers de configuration de l'éditeur
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignorer les fichiers système
+.DS_Store
+Thumbs.db
