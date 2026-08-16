@@ -7,11 +7,14 @@
 *.tfstate.*
 *.tfstate.backup
 
-# Ignorer les fichiers de variables sensibles (contenant des secrets)
+# Ignorer les fichiers de variables sensibles
 *.tfvars
 *.tfvars.json
 *.auto.tfvars
 *.auto.tfvars.json
+# terraform.tfvars ne contient aucun secret (juste l'identité des repos GitHub) :
+# il doit être versionné pour que la trust policy OIDC reste correcte.
+!terraform.tfvars
 
 # Ignorer les fichiers de plan Terraform
 *.plan

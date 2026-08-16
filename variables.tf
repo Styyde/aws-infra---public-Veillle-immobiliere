@@ -1,4 +1,3 @@
-# variables.tf
 variable "aws_region" {
   description = "Région AWS"
   type        = string
@@ -46,13 +45,13 @@ variable "public_subnet_cidrs" {
 variable "kubernetes_version" {
   description = "Version de Kubernetes"
   type        = string
-  default     = "1.28"
+  default     = "1.33"
 }
 
 variable "node_instance_types" {
   description = "Type d'instance pour les nodes EKS"
   type        = list(string)
-  default     = ["t3.medium"]   # Changez en ["t3.small"] pour réduire les coûts
+  default     = ["t3.medium"]
 }
 
 variable "node_min_size" {
@@ -71,6 +70,12 @@ variable "node_desired_size" {
   description = "Nombre souhaité de nodes"
   type        = number
   default     = 2
+}
+
+variable "bastion_instance_type" {
+  description = "Type d'instance du bastion SSM (accès admin privé à EKS/Argo CD)"
+  type        = string
+  default     = "t3.micro"
 }
 
 # ---- ECR ----
@@ -111,21 +116,38 @@ variable "db_username" {
   sensitive   = true
 }
 
-variable "db_password" {
-  description = "Mot de passe de la base"
-  type        = string
-  sensitive   = true
-}
+# Le mot de passe RDS est généré automatiquement (random_password.db) et stocké
+# uniquement dans AWS Secrets Manager — jamais dans Git ni dans une variable Terraform.
 
 # ---- IAM ----
 variable "github_organization" {
   description = "Nom de l'organisation GitHub"
   type        = string
-  default     = "votre-org"
+  default     = "votre-org" # À remplacer par ton organisation
 }
 
 variable "github_repository" {
-  description = "Nom du repository GitHub"
+  description = "Nom du repository GitHub (celui du code Flask)"
   type        = string
   default     = "veille-immo"
+}
+
+# ---- GitOps (pour Argo CD) ----
+variable "gitops_repo_url" {
+  description = "URL du dépôt GitOps"
+  type        = string
+  default     = "https://github.com/Styyde/flask-gitops---public-veille-immobiliere.git"
+}
+
+# ---- Domaines ----
+variable "domain_name" {
+  description = "Domaine principal pour l'application (ex: amandal.kolynois.com)"
+  type        = string
+  default     = "amandal.kolynois.com"
+}
+
+variable "hosted_zone_name" {
+  description = "Nom de la zone Route53 (ex: kolynois.com)"
+  type        = string
+  default     = "kolynois.com"
 }
