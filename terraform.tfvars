@@ -4,7 +4,8 @@ github_organization = "Styyde"
 github_repository   = "flask-app---public-veille-immobiliere"
 
 # Repo GitOps que Argo CD surveille et que la CI met à jour (bump du tag image).
-gitops_repo_url = "https://github.com/Styyde/flask-gitops---public-veille-immobiliere.git"
+gitops_repo_url = "https://github.com/Styyde/flask-gitops---public-veille-immobiliere"
 
 # db_username reste à fournir séparément (variable sensible, pas de défaut) :
 # via TF_VAR_db_username, un fichier *.auto.tfvars.gitignored, ou -var à l'apply.
+db_username = "veilleimmo_admin"

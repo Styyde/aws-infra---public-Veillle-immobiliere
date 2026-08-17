@@ -55,6 +55,9 @@ output "bastion_instance_id" {
 output "argocd_access_instructions" {
   value = <<-EOT
     Cluster EKS privé — accès admin uniquement via SSM :
+      0. (une seule fois) Bootstrap des composants Helm :
+         terraform output -raw bootstrap_script > bootstrap.sh
+         # puis coller ce script dans la session SSM ci-dessous et l'exécuter : bash bootstrap.sh
       1. aws ssm start-session --target ${aws_instance.bastion.id}
       2. aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}
       3. kubectl port-forward -n argocd svc/argocd-server 8080:443 --address 0.0.0.0
@@ -64,4 +67,9 @@ output "argocd_access_instructions" {
         --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
     Puis ouvrir https://localhost:8080
   EOT
+}
+
+output "bootstrap_script" {
+  description = "Script d'installation des composants Helm (Argo CD, ALB Controller, ExternalDNS, External Secrets). A exécuter manuellement depuis le bastion, jamais depuis un poste local (cluster privé). Récupérer avec : terraform output -raw bootstrap_script > bootstrap.sh"
+  value       = local.bootstrap_script
 }

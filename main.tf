@@ -644,12 +644,13 @@ resource "aws_iam_role_policy_attachment" "external_dns_attach" {
   policy_arn = aws_iam_policy.external_dns_policy.arn
 }
 
-# ─── BOOTSTRAP POST-DEPLOY (script) ──────────────────────────────────────────
-# ATTENTION : le cluster EKS est privé (cluster_endpoint_public_access = false).
-# Ce local-exec doit être lancé depuis une machine à l'intérieur du VPC, donc
-# `terraform apply` doit être exécuté depuis le bastion SSM (bastion.tf), et non
-# depuis un poste local ou un runner GitHub Actions hébergé (public).
-# Voir bastion.tf pour la procédure d'accès via SSM Session Manager.
+# ─── BOOTSTRAP POST-DEPLOY (script, rendu mais non exécuté par Terraform) ────
+# Le cluster EKS est privé (cluster_endpoint_public_access = false) : aucune
+# machine hors VPC ne peut joindre son API. Terraform ne fait donc plus de
+# kubectl/helm lui-même (ancien null_resource + local-exec, retiré) : le
+# rendu ci-dessous est exposé via l'output `bootstrap_script` et doit être
+# exécuté manuellement depuis le bastion (cf. bastion.tf pour la procédure
+# complète et les schémas réseau/IAM).
 locals {
   bootstrap_script = templatefile("${path.module}/scripts/bootstrap.sh.tpl", {
     cluster_name          = module.eks.cluster_name
@@ -662,27 +663,4 @@ locals {
     grafana_secret_name   = aws_secretsmanager_secret.grafana_admin.name
     domain_name           = var.domain_name
   })
-}
-
-resource "null_resource" "bootstrap" {
-  depends_on = [
-    module.eks,
-    aws_eks_node_group.application_workers,
-    aws_iam_role.alb_controller,
-    aws_iam_role.external_dns,
-    aws_iam_role.external_secrets,
-    aws_secretsmanager_secret_version.db_credentials,
-    aws_secretsmanager_secret_version.grafana_admin,
-    aws_acm_certificate_validation.app,
-  ]
-
-  triggers = {
-    script_hash  = sha1(local.bootstrap_script)
-    cluster_name = module.eks.cluster_name
-  }
-
-  provisioner "local-exec" {
-    command     = local.bootstrap_script
-    interpreter = ["bash", "-c"]
-  }
 }

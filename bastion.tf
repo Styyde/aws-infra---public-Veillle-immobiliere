@@ -1,13 +1,39 @@
-# ─── Bastion SSM (accès admin privé à EKS / Argo CD) ────────────────────────
-# Pas d'IP publique, aucun port entrant ouvert : l'accès se fait uniquement via
-# AWS Systems Manager Session Manager (auth IAM, sessions journalisées dans
-# CloudTrail). C'est le seul point d'entrée pour administrer le cluster EKS
-# privé et atteindre Argo CD (qui reste en ClusterIP, cf. scripts/bootstrap.sh.tpl).
+# ─── Bastion SSM (administrateur interne VPC du cluster EKS) ────────────────
+# Pas d'IP publique, aucun port entrant ouvert (pas de SSH) : l'accès se fait
+# uniquement via AWS Systems Manager Session Manager (auth IAM, sessions
+# journalisées dans CloudTrail).
+#
+#   Internet ──(❌ pas d'accès SSH)──> [Bastion, subnet privé]
+#                                          │ SSM Session
+#                                          ▼ kubectl / helm
+#                                     [EKS private API]
+#
+# Deux couches d'autorisation distinctes :
+#   - Réseau  : le SG du bastion peut atteindre le SG du control plane EKS sur
+#     443 (règle aws_security_group_rule.bastion_to_eks_api ci-dessous).
+#   - Identité : le rôle IAM du bastion est enregistré comme EKS access entry
+#     avec la policy cluster-admin (aws_eks_access_entry / _access_policy_association
+#     ci-dessous) -> une fois authentifié, kubectl/helm ont les droits RBAC admin.
+#
+# Le bastion sert pour : bootstrap initial des composants Helm (Argo CD, ALB
+# Controller, External Secrets, metrics-server, ExternalDNS), diagnostic et
+# administration du cluster, dépannage, et accès à Argo CD (qui reste en
+# ClusterIP, jamais exposé sur Internet). Terraform ne fait plus de kubectl/helm
+# lui-même (cf. suppression de l'ancien null_resource.bootstrap dans main.tf) :
+# ces opérations sont désormais exécutées manuellement, depuis le bastion.
 #
 # Accès :
 #   aws ssm start-session --target <bastion_instance_id>
 #   # une fois dans la session :
 #   aws eks update-kubeconfig --region <region> --name <cluster_name>
+#   kubectl get nodes
+#
+#   # bootstrap initial des composants Helm (une seule fois) :
+#   #   1. depuis le poste local : terraform output -raw bootstrap_script > bootstrap.sh
+#   #   2. coller le contenu de bootstrap.sh dans la session SSM (ou le transférer
+#   #      via `aws ssm send-command`), puis : bash bootstrap.sh
+#
+#   # accès à Argo CD (ClusterIP, jamais public) :
 #   kubectl port-forward -n argocd svc/argocd-server 8080:443 --address 0.0.0.0
 #
 #   # depuis le poste local, dans un second terminal :
@@ -119,6 +145,19 @@ resource "aws_security_group" "bastion" {
   tags = {
     Environment = var.environment
   }
+}
+
+# Autorise le bastion à atteindre l'API EKS privée sur 443. Sans cette règle,
+# le SG du control plane EKS n'accepte aucun trafic entrant depuis le bastion,
+# quels que soient ses droits IAM/RBAC.
+resource "aws_security_group_rule" "bastion_to_eks_api" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.bastion.id
+  security_group_id        = module.eks.cluster_primary_security_group_id
+  description              = "Bastion SSM access to private EKS API (kubectl/helm)"
 }
 
 resource "aws_instance" "bastion" {
