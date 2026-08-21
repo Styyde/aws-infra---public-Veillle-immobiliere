@@ -52,8 +52,74 @@ data "aws_ami" "al2023" {
   }
 }
 
+# ─── Plafond IAM du bastion (permissions boundary) ───────────────────────────
+# Le bastion n'est PAS un second runner Terraform : il ne doit jamais pouvoir
+# créer/modifier de l'infrastructure AWS (VPC, IAM, RDS, S3, Route53, Secrets
+# Manager, ECR...). Cette boundary plafonne le rôle à deux familles d'actions,
+# quoi qu'on lui attache par ailleurs plus tard :
+#   - SSM / SSM Messages / EC2 Messages : connectivité Session Manager (aucune
+#     de ces actions ne crée de ressource AWS, elles gèrent uniquement l'agent).
+#   - eks:DescribeCluster + sts:GetCallerIdentity : récupérer un kubeconfig et
+#     s'authentifier. Les droits d'administration réels sur le cluster sont
+#     accordés côté RBAC Kubernetes par l'EKS access entry ci-dessous, pas par
+#     IAM -> le bastion est admin *du cluster*, pas admin *du compte AWS*.
+resource "aws_iam_policy" "bastion_boundary" {
+  name        = "${local.cluster_name}-bastion-boundary"
+  description = "Plafond de permissions du bastion : SSM + lecture EKS uniquement, aucun droit de provisioning AWS"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Liste identique (pas de wildcard ssm:*) à celle de la managed policy
+        # AmazonSSMManagedInstanceCore attachée plus bas : la boundary ne doit
+        # pas être plus permissive que nécessaire, sinon elle ne plafonne
+        # plus rien. Notamment PAS ssm:SendCommand/StartAutomationExecution
+        # (contrôle d'autres instances) ni ssm:PutParameter (écriture).
+        Sid    = "SSMConnectivity"
+        Effect = "Allow"
+        Action = [
+          "ssm:DescribeAssociation",
+          "ssm:GetDeployablePatchSnapshotForInstance",
+          "ssm:GetDocument",
+          "ssm:DescribeDocument",
+          "ssm:GetManifest",
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:ListAssociations",
+          "ssm:ListInstanceAssociations",
+          "ssm:PutInventory",
+          "ssm:PutComplianceItems",
+          "ssm:PutConfigurePackageResult",
+          "ssm:UpdateAssociationStatus",
+          "ssm:UpdateInstanceAssociationStatus",
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
+          "ec2messages:GetEndpoint",
+          "ec2messages:GetMessages",
+          "ec2messages:SendReply",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "EKSReadOnlyAuth"
+        Effect   = "Allow"
+        Action   = ["eks:DescribeCluster", "sts:GetCallerIdentity"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
 resource "aws_iam_role" "bastion" {
-  name = "${local.cluster_name}-bastion-role"
+  name                 = "${local.cluster_name}-bastion-role"
+  permissions_boundary = aws_iam_policy.bastion_boundary.arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -160,28 +226,70 @@ resource "aws_security_group_rule" "bastion_to_eks_api" {
   description              = "Bastion SSM access to private EKS API (kubectl/helm)"
 }
 
-resource "aws_instance" "bastion" {
-  ami                         = data.aws_ami.al2023.id
-  instance_type               = var.bastion_instance_type
-  subnet_id                   = module.vpc.private_subnets[0]
-  vpc_security_group_ids      = [aws_security_group.bastion.id]
-  iam_instance_profile        = aws_iam_instance_profile.bastion.name
-  associate_public_ip_address = false
+# Bastion en ASG à 1 instance (min=max=desired=1) plutôt qu'une aws_instance
+# nue : si l'instance meurt (crash, maintenance AWS, AZ down), l'ASG en
+# relance une automatiquement -- y compris dans une autre AZ puisque
+# vpc_zone_identifier couvre tous les subnets privés. Ce n'est pas de la HA
+# au sens "toujours dispo sans interruption" (un admin devra relancer sa
+# session SSM), mais ça élimine le "reste mort tant que quelqu'un ne fait pas
+# terraform apply à la main".
+resource "aws_launch_template" "bastion" {
+  name_prefix   = "${local.cluster_name}-bastion-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = var.bastion_instance_type
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.bastion.name
+  }
+
+  vpc_security_group_ids = [aws_security_group.bastion.id]
 
   metadata_options {
     http_tokens = "required" # IMDSv2 uniquement
   }
 
-  user_data = <<-EOF
+  user_data = base64encode(<<-EOF
     #!/bin/bash
-    dnf install -y unzip
-    curl -o /tmp/kubectl "https://s3.us-west-2.amazonaws.com/amazon-eks/${var.kubernetes_version}.0/2024-01-04/bin/linux/amd64/kubectl"
-    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-  EOF
+    set -e
+    dnf install -y unzip tar gzip
 
-  tags = {
-    Name        = "${local.cluster_name}-bastion"
-    Environment = var.environment
+    curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/v${var.kubernetes_version}.0/bin/linux/amd64/kubectl"
+    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+    curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  EOF
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "${local.cluster_name}-bastion"
+      Environment = var.environment
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "bastion" {
+  name                = "${local.cluster_name}-bastion-asg"
+  vpc_zone_identifier = module.vpc.private_subnets
+  min_size            = 1
+  max_size            = 1
+  desired_capacity    = 1
+  health_check_type   = "EC2"
+
+  launch_template {
+    id      = aws_launch_template.bastion.id
+    version = aws_launch_template.bastion.latest_version
+  }
+
+  tag {
+    key                 = "Environment"
+    value               = var.environment
+    propagate_at_launch = true
   }
 
   depends_on = [module.eks]

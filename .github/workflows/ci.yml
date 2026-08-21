@@ -1,0 +1,120 @@
+name: Terraform CI
+
+# Jusqu'ici, aucune vérification automatique sur ce repo : fmt/validate/scan
+# sécurité se faisaient (ou pas) à la main avant un apply local. Cette CI
+# tourne sans aucun accès AWS (safe même sur une PR venant d'un fork) : elle
+# ne fait que de la vérification statique. Le job "plan" tout en bas est
+# volontairement désactivé par défaut, cf. son commentaire.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: terraform init (sans backend distant -- validation statique uniquement)
+        run: terraform init -backend=false
+      - name: terraform validate
+        run: terraform validate
+
+  tflint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+      - name: Init tflint plugins (ruleset AWS)
+        run: |
+          cat > .tflint.hcl <<'EOF'
+          plugin "aws" {
+            enabled = true
+            version = "0.35.0"
+            source  = "github.com/terraform-linters/tflint-ruleset-aws"
+          }
+          EOF
+          tflint --init
+      - name: tflint
+        run: tflint --recursive
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy (config -- scan IaC Terraform)
+        # Même outil que flask-app/.github/workflows/ci.yml (scan image/fs) --
+        # un seul scanner à connaître pour toute l'org plutôt que d'ajouter
+        # tfsec/checkov en plus.
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          skip-dirs: .terraform
+
+  # ─── Plan (désactivé par défaut) ───────────────────────────────────────
+  # Ce job a besoin de deux prérequis qui n'existent pas encore côté AWS :
+  #   1. Le backend S3 réactivé (backend.tf est commenté -- state en local
+  #      aujourd'hui) + un bucket S3 + une table DynamoDB pour le lock.
+  #   2. Un rôle IAM OIDC dédié pour GitHub Actions sur CE repo (différent du
+  #      rôle github_actions de main.tf, qui ne peut que pousser sur ECR) --
+  #      un plan a besoin de pouvoir LIRE tous les types de ressources gérées
+  #      ici (VPC, EKS, RDS, IAM...), donc des droits larges. Ne pas
+  #      improviser ça sans réfléchir au blast radius.
+  # Tant que ces deux points ne sont pas faits, ce job reste no-op (gardé par
+  # la variable de repo TF_BACKEND_ENABLED, à mettre à "true" dans
+  # Settings > Secrets and variables > Actions > Variables une fois prêt).
+  plan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && vars.TF_BACKEND_ENABLED == 'true'
+    needs: [fmt, validate]
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TF_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: terraform init
+        run: terraform init
+      - name: terraform plan
+        run: terraform plan -no-color -out=tfplan
+      - name: Publier le plan en commentaire de PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const plan = execSync('terraform show -no-color tfplan').toString();
+            const body = `#### Terraform Plan\n<details><summary>Afficher le plan</summary>\n\n\`\`\`\n${plan.slice(0, 60000)}\n\`\`\`\n</details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

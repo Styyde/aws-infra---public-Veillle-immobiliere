@@ -139,6 +139,14 @@ variable "gitops_repo_url" {
   default     = "https://github.com/Styyde/flask-gitops---public-veille-immobiliere.git"
 }
 
+# ---- Alerting ----
+variable "alertmanager_slack_webhook_url" {
+  description = "URL du webhook Slack entrant pour les notifications Alertmanager. Laisser vide pour désactiver l'envoi Slack (les alertes continuent d'exister dans Alertmanager, juste sans notification). A fournir via TF_VAR_alertmanager_slack_webhook_url ou secret.auto.tfvars -- jamais en dur ici."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 # ---- Domaines ----
 variable "domain_name" {
   description = "Domaine principal pour l'application (ex: amandal.kolynois.com)"

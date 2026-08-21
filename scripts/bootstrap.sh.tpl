@@ -24,6 +24,9 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --set serviceAccount.name=aws-load-balancer-controller \
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${alb_role_arn}
 
+echo "Attente que le webhook du AWS Load Balancer Controller soit prêt..."
+kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
+
 # 4. Installer Metrics Server
 echo "Installation de Metrics Server..."
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
@@ -61,6 +64,8 @@ helm upgrade --install external-secrets external-secrets/external-secrets \
 
 echo "Attente d'External Secrets Operator..."
 kubectl rollout status deployment/external-secrets -n external-secrets --timeout=300s
+kubectl rollout status deployment/external-secrets-webhook -n external-secrets --timeout=300s
+kubectl rollout status deployment/external-secrets-cert-controller -n external-secrets --timeout=300s
 kubectl wait --for=condition=Established crd/clustersecretstores.external-secrets.io --timeout=120s
 kubectl wait --for=condition=Established crd/externalsecrets.external-secrets.io --timeout=120s
 
@@ -82,6 +87,23 @@ spec:
             namespace: external-secrets
 EOF
 
+# 6bis. Installer Cluster Autoscaler
+echo "Installation de Cluster Autoscaler..."
+helm repo add autoscaler https://kubernetes.github.io/autoscaler
+helm repo update
+helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
+  --namespace kube-system \
+  --set autoDiscovery.clusterName=${cluster_name} \
+  --set awsRegion=${region} \
+  --set rbac.serviceAccount.create=true \
+  --set rbac.serviceAccount.name=cluster-autoscaler \
+  --set rbac.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${cluster_autoscaler_role} \
+  --set extraArgs.balance-similar-node-groups=true \
+  --set extraArgs.skip-nodes-with-system-pods=false
+
+echo "Attente de Cluster Autoscaler..."
+kubectl rollout status deployment/cluster-autoscaler -n kube-system --timeout=180s
+
 # 7. Installer Argo CD
 echo "Installation d'Argo CD..."
 helm repo add argo https://argoproj.github.io/argo-helm
@@ -101,13 +123,16 @@ kubectl rollout status deployment/argocd-repo-server -n argocd --timeout=300s
 kubectl rollout status statefulset/argocd-application-controller -n argocd --timeout=300s
 kubectl wait --for=condition=Established crd/applications.argoproj.io --timeout=120s
 
-# 9. Créer l'Application Flask (avec le domaine)
-echo "Création de l'Application Flask..."
+# 9. Créer le root-app (pattern "app of apps") : Argo CD synchronise ensuite
+#    tout ce qui se trouve dans argocd/applications/ (flask-app, monitoring,
+#    yace, et toute future Application ajoutée par un simple commit) --
+#    c'est le SEUL apply manuel requis ici, plus jamais un par composant.
+echo "Création du root-app (app of apps)..."
 kubectl apply -f - <<EOF
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: flask-app
+  name: root-app
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io
@@ -116,43 +141,12 @@ spec:
   source:
     repoURL: ${gitops_repo_url}
     targetRevision: main
-    path: apps/flask-app
-    helm:
-      valueFiles:
-        - values.yaml
+    path: argocd/applications
+    directory:
+      recurse: false
   destination:
     server: https://kubernetes.default.svc
-    namespace: production
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-EOF
-
-# 10. Créer l'Application Monitoring
-echo "Création de l'Application Monitoring..."
-kubectl apply -f - <<EOF
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: monitoring
-  namespace: argocd
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: default
-  source:
-    repoURL: ${gitops_repo_url}
-    targetRevision: main
-    path: monitoring
-    helm:
-      valueFiles:
-        - values.yaml
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: monitoring
+    namespace: argocd
   syncPolicy:
     automated:
       prune: true
@@ -169,3 +163,7 @@ echo "Secret DB dans Secrets Manager : ${db_secret_name} (région ${region})"
 echo "  -> à référencer via remoteRef.key dans l'ExternalSecret de flask-gitops/apps/flask-app"
 echo "Secret Grafana dans Secrets Manager : ${grafana_secret_name} (région ${region})"
 echo "  -> à référencer via remoteRef.key dans flask-gitops/monitoring/templates/externalsecret-grafana.yaml"
+echo "Rôle IAM YACE : ${yace_role_arn}"
+echo "  -> à coller dans l'annotation eks.amazonaws.com/role-arn de flask-gitops/yace/values.yaml"
+echo "Secret Alertmanager/Slack dans Secrets Manager : ${alertmanager_secret_name} (région ${region})"
+echo "  -> à référencer via remoteRef.key dans flask-gitops/monitoring/templates/externalsecret-alertmanager-slack.yaml"

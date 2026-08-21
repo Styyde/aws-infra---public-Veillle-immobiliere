@@ -17,8 +17,17 @@
 !terraform.tfvars
 
 # Ignorer les fichiers de plan Terraform
+# ("*.plan" ne matchait pas "*.tfplan" -> un plan peut contenir des valeurs
+# sensibles en clair (mots de passe RDS/Grafana, etc.) même quand la sortie
+# CLI les masque -- ne jamais committer un fichier de plan.
 *.plan
+*.tfplan
 *.out
+
+# Script de bootstrap rendu (généré depuis scripts/bootstrap.sh.tpl via
+# `terraform output -raw bootstrap_script`) : artefact de sortie, pas une
+# source à versionner.
+bootstrap.sh
 
 # Ignorer les logs, traces, fichiers de test
 *.log
