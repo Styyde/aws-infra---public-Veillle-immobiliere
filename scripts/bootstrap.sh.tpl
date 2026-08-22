@@ -1,6 +1,16 @@
 #!/bin/bash
 set -e
 
+# HOME n'est pas toujours positionné selon la méthode d'exécution (ex: SSM
+# Run Command, contrairement à une session SSM interactive classique) --
+# kubectl résout son kubeconfig via $HOME/.kube/config et se rabat sinon
+# silencieusement sur http://localhost:8080 (connection refused en boucle,
+# jamais une vraie erreur explicite). aws eks update-kubeconfig n'a pas ce
+# problème (résolution via la base utilisateurs système), d'où le piège :
+# le fichier est bien écrit dans /root/.kube/config mais kubectl ne le trouve
+# pas. On force donc HOME explicitement avant tout appel kubectl/helm.
+export HOME=/root
+
 echo "=== Bootstrapping Kubernetes components ==="
 
 # 1. Configurer kubectl
@@ -12,6 +22,35 @@ timeout 300 bash -c 'until kubectl get --raw=/healthz >/dev/null 2>&1; do sleep 
 
 echo "Attente qu'au moins un noeud soit Ready..."
 timeout 300 bash -c 'until [ "$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready")" -ge 1 ]; do sleep 5; done'
+
+# 2bis. StorageClass par défaut (le pilote est l'addon EKS "aws-ebs-csi-driver",
+# géré par Terraform -- ici on ne fait que déclarer la StorageClass qui
+# l'utilise et la marquer par défaut). Sans ça, tout PVC sans storageClassName
+# explicite -- comme celui de Loki -- reste Pending indéfiniment.
+echo "Création de la StorageClass par défaut (gp3, ebs.csi.aws.com)..."
+kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+parameters:
+  type: gp3
+EOF
+
+# Un PVC déjà créé AVANT qu'une StorageClass par défaut n'existe reste avec
+# storageClassName="" figé (jamais réévalué a posteriori) -- on supprime donc
+# tout PVC resté bloqué en Pending pour qu'il soit recréé proprement par son
+# StatefulSet au prochain sync Argo CD, cette fois avec la classe par défaut.
+echo "Nettoyage des PVC restés Pending avant l'installation du pilote EBS CSI..."
+kubectl get pvc -A --no-headers 2>/dev/null | awk '$3 == "Pending" {print $1, $2}' | while read -r ns name; do
+  echo "  -> suppression de $ns/$name"
+  kubectl delete pvc "$name" -n "$ns"
+done
 
 # 3. Installer AWS Load Balancer Controller
 echo "Installation de AWS Load Balancer Controller..."
@@ -25,6 +64,17 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${alb_role_arn}
 
 echo "Attente que le webhook du AWS Load Balancer Controller soit prêt..."
+kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
+
+# Le chart régénère un nouveau certificat/CA auto-signé pour le webhook à
+# CHAQUE helm upgrade (pas seulement au premier install). Si le pod existant
+# n'est pas redémarré, il continue de servir l'ancien certificat alors que
+# le MutatingWebhookConfiguration référence déjà la nouvelle CA -> échec TLS
+# "certificate signed by unknown authority" pour toute création de Service
+# par la suite (Cluster Autoscaler, etc.). On force donc un restart après
+# chaque upgrade pour garantir la cohérence cert/CA, que ce soit un premier
+# déploiement ou un re-run.
+kubectl rollout restart deployment/aws-load-balancer-controller -n kube-system
 kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
 
 # 4. Installer Metrics Server
@@ -91,8 +141,19 @@ EOF
 echo "Installation de Cluster Autoscaler..."
 helm repo add autoscaler https://kubernetes.github.io/autoscaler
 helm repo update
+# image.tag figé sur la version mineure de Kubernetes du cluster (1.33) --
+# le chart installe par défaut la dernière image Cluster Autoscaler (ex:
+# 1.35.0, prévue pour k8s 1.35), qui embarque des informers pour les CRD de
+# Dynamic Resource Allocation (ResourceClaim/ResourceSlice/DeviceClass).
+# Ces CRD n'existent pas sur un cluster 1.33 : WaitForCacheSync() bloque
+# indéfiniment en attendant leur synchronisation, et le pod reste
+# "Running/Ready" (le probe de santé ne vérifie pas la boucle de scaling)
+# sans jamais évaluer le moindre pod pending -- aucun crash, aucun log
+# d'erreur visible, juste un scaling qui ne se déclenche jamais.
 helm upgrade --install cluster-autoscaler autoscaler/cluster-autoscaler \
   --namespace kube-system \
+  --set image.tag=v1.33.5 \
+  --set fullnameOverride=cluster-autoscaler \
   --set autoDiscovery.clusterName=${cluster_name} \
   --set awsRegion=${region} \
   --set rbac.serviceAccount.create=true \
